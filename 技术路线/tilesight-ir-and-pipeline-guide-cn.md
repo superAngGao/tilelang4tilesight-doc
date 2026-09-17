@@ -238,7 +238,7 @@ result = model_native(kernel, region, arch)
 
 `PhaseRegion(load_a)` 表示该叶子包含 load_a 这项工作。阶段的时间端点是 `load_a.start` 和 `load_a.done`，不由 PhaseRegion 表示。
 
-### 3.1 为什么已有循环次数，还需要周期 DAG
+### 3.1 为什么 Region 已有循环结构和次数，还需要周期 DAG？
 
 “load、compute 重复 128 次”不能区分完全串行和跨轮预取。循环名称和次数不能回答数据何时就绪、是否存在累加器跨轮状态、缓冲槽何时释放。
 
@@ -259,11 +259,39 @@ result = model_native(kernel, region, arch)
 | `search_config` | 调度搜索配置 |
 | `legacy_stage_boundary` | 旧式 stage 边界策略的附加配置，不是通用依赖提取规则 |
 
+`summary_policy` 决定循环如何交给外层组合：`macro` 先分析内部周期 DAG，再将整个循环汇总为一个执行单元；当前固定版本的 `auto` 也走这条路径。`inline` 意图展开内部执行，但当前执行器对非零轮次的周期循环尚不支持，会报错。它不是最佳／最坏流水的选择（那是 `ii_mode`），也不能用来开启跨 Region 重叠。
+
+`boundary_anchor_phase` **不是依赖边**，而是 `boundary_policy="finite_witness"` 下拆分时间的参照 Phase 名称。例如指定 `"mma"`：循环开始到第一轮 mma **开始**为启动段，第一轮到最后一轮 mma **开始**之间为中间段，最后一轮 mma 开始到循环内全部操作完成为收尾段。prologue、epilogue 再分别计入启动和收尾部分。更换有效锚点只改变分段口径，不增加依赖，也不改变这次有限调度的完整执行时间。
+
 例如 TIR 循环变量 `k`、Region 名称 `k_loop`、前端循环名 `k_pipeline` 可以不同。前端建立关联，TileSight 不按名称相似性猜测对应关系。
 
 ## 4. Actor：执行角色，不是硬件资源本身
 
-ActorIR 保存 `name`、`phases`、`sequence`、`order`、`execution_scope`、可选 `execution_domain` 及兼容性字段 `serial_resource`。
+Actor 表示一组操作的执行角色。builder 中通过 `pipeline.actor(...)` 创建它，登记工作和顺序后，`kernel.build()` 将其保存为 `ActorIR`。下面是全部 7 个成员的调用形式；`actor_phases` 代表已登记的前端 Phase：
+
+```python
+ActorIR(
+    name="producer",              # 角色名称，不按名称推断硬件行为
+    serial_resource=None,         # 兼容旧接口的固定资源顺序声明，通常不填
+    phases=actor_phases,           # 属于这个角色的前端 Phase 集合
+    sequence=(),                  # 显式的周期操作顺序：Phase.at(...) 序列
+    order="issue",                # sequence 的含义：issue 或 completion
+    execution_scope="warpgroup",  # 角色的执行范围，不是资源名称
+    execution_domain=None,        # 可选的执行范围数量等补充描述
+)
+```
+
+| 成员 | 表示什么 | 不表示什么 |
+|---|---|---|
+| `name` | 当前循环内的角色名称，例如 producer、consumer | 不因名称叫 producer 就自动产生 TMA 操作 |
+| `serial_resource` | 旧接口兼容字段；配合 actor sequence，生成对应资源的固定周期使用顺序 | 不是该 actor 的全部资源清单，也不提供资源耗时；新声明优先使用独立的 `pipeline.resource_sequence(...)` |
+| `phases` | 这个角色负责的工作集合 | 登记顺序本身不要求前一个完成后才开始下一个 |
+| `sequence` | 显式指定的 `Occurrence` 序列，例如 `(a.at(0), b.at(0))`；每项引用 Phase 和所在迭代位置 | 不是已算出的时间线；空序列表示未声明这类角色顺序，不表示没有其他依赖 |
+| `order` | `issue` 生成开始到开始的零延迟约束；`completion` 生成完成到开始约束 | `issue` 不包含实际指令发射的耗时；没有 sequence 时，仅设置 order 不会产生顺序边 |
+| `execution_scope` | `unspecified`、`thread`、`warp`、`warpgroup`、`cta` 或 `cta_group` | 不是具体线程编号，也不是 SM 上的 CTA 驻留数 |
+| `execution_domain` | 可选 `ExecutionDomain`：补充 scope、每 CTA 的实例数、每实例成员数以及来源标记；scope 必须与 actor 一致 | 不自动给出物理线程映射，也不替代 Phase 的工作量和 Timing |
+
+例如两个负责加载的 warp 可以用 `scope="warp", instances_per_cta=2` 描述其执行范围；这不是“每个 SM 驻留两个 CTA”。执行范围信息可供归属与生命周期等分析使用，不能仅凭这个数量就认为 DAG 自动复制了全部工作。
 
 - actor 回答：哪些操作由同一执行角色负责，明确的程序顺序是什么。
 - ResourceTiming 回答：操作执行时使用什么建模资源，使用多久。
@@ -285,13 +313,19 @@ actor.sequence(a.at(0), b.at(0), order="issue")
 
 ### 5.1 完成时间与资源占用不是相加关系
 
-前端时间对象的关键字段为：
+下面给出一个同时使用 CUDA 和 SFU 两种资源的 Phase Timing。**数值只是说明接口的教学输入，不代表某个实际操作的定标结果。**
 
 ```python
-Timing(
-    latency=...,  # 从阶段开始到完成，单位秒
+ns = 1e-9
+timing = Timing(
+    latency=100 * ns,  # 整个阶段从开始到结果可用，共 100 ns
     resources=(
-        ResourceTiming(resource="tensor", service_time=..., offset=...),
+        ResourceTiming(
+            resource="cuda", service_time=60 * ns, offset=0 * ns,
+        ),  # 相对阶段起点，在 [0, 60) ns 占用 CUDA 资源
+        ResourceTiming(
+            resource="sfu", service_time=50 * ns, offset=30 * ns,
+        ),  # 在 [30, 80) ns 占用 SFU 资源
     ),
 )
 ```
@@ -300,7 +334,9 @@ Timing(
 - `service_time`：某个建模资源被占用多久，影响其他阶段的资源竞争。
 - `offset`：资源占用相对阶段起点的偏移。
 
-例如阶段完成需要 100 ns，而资源只在 `[0, 30)` ns 被占用，则独立工作可以在资源释放后使用它，但依赖该阶段结果的工作仍需等到 100 ns。不是 `100 + 30 = 130 ns`。
+这个例子中，两种资源在 `[30, 60)` ns 重叠使用。CUDA 在 60 ns 后释放，SFU 在 80 ns 后释放；在其他约束允许时，独立工作可以使用已释放的资源。依赖本阶段完整结果的后继仍需等到 100 ns。
+
+**阶段完成时间是 100 ns，不是 `60 + 50 = 110 ns`，更不是 `100 + 60 + 50 = 210 ns`。** 80–100 ns 表示本例给定的“资源服务已结束、结果尚未就绪”的等待；这个间隔同样是输入假设，不是 TileSight 自动推导出的额外成本。
 
 一个 Phase 可以使用多个不同资源。资源列表的排列顺序没有时间含义，内部先后或重叠由 `offset` 明确给出；默认 `offset=0` 表示从阶段起点开始，不表示未知。调度器移动整个 Phase，不会重新搜索它内部各资源区间的排列。
 
@@ -437,7 +473,60 @@ print("kernel body (s):", result.kernel_body_s)
 
 原始源程序的对应关系为：循环前 clear → initialize；循环内 copy A/B、矩阵乘 → body；循环后写回 → store。对其他程序必须按实际循环和作用域提取，不能按算子名字套用这个边界。
 
-## 7. 官方前端如何组装 PeriodicDAG
+## 7. Region 中周期分析的细节：官方前端如何组装 PeriodicDAG
+
+本节展开第 2、3 节的 `LoopRegion.periodic_axis`：**执行器分析到这个循环区域时，如何取得其周期 DAG。** 这不是另外启动一套与 Region 无关的完整 kernel 分析。
+
+先解释示例里一直使用的 `pipeline`：
+
+```python
+pipeline = launch.periodic(
+    "k_pipeline", iterations=128, stages=3,
+)
+```
+
+`pipeline` 是我们给返回对象起的 Python 变量名，实际类型为官方前端的 `PeriodicLoop`。它是**循环内工作和约束的声明容器**，不是已经排好的流水，也不是另一种 Region。官方也提供 `launch.pipeline(...)`，它是 `launch.periodic(...)` 的别名。
+
+在这个容器中，通过 `actor` 登记角色和 Phase，通过 `after`、`carry`、`pipeline_buffer` 等登记同轮依赖、跨轮状态与缓冲关系。`kernel.build()` 将这些声明保存为 `LaunchIR` 下的 `PeriodicLoopIR`。
+
+`iterations=128` 是前端循环次数声明，`stages=3` 是流水级数配置；它们本身不足以构造流水，仍需登记具体的 Phase、依赖及缓冲获取／释放关系。Region 一侧用 `trip_count=128` 描述本次有限执行次数，使用时应与对应前端声明保持一致。
+
+**因此，这里讲的是 Region 的周期分析细节，但 pipeline 对象不直接存放在 Region 内，而是由 Region 引用：**
+
+```text
+kernel 中的声明                          本次分析的 Region
+LaunchIR                                LoopRegion("k_loop", trip_count=128)
+└─ PeriodicLoopIR("k_pipeline")          ├─ prologue / body / epilogue
+   ├─ actors → phases                   └─ periodic_axis
+   ├─ dependencies / carries               └─ loop_name="k_pipeline"
+   └─ buffers / 资源顺序等                            │
+                ↑────────────────── 按名称查找 ──────┘
+                │
+       官方 lower_periodic 转换
+                ↓
+           PeriodicDAG
+                ↓
+       调度器分析 II 和阶段起点
+                ↓
+       Region 执行器组合有限循环及前后操作的时间
+```
+
+具体引用写法为：
+
+```python
+region = LoopRegion(
+    name="k_loop",
+    trip_count=128,
+    body=iteration_region,          # 引用同一批前端 Phase
+    prologue=initialize_region,
+    epilogue=store_region,
+    periodic_axis=PeriodicAxisIR(loop_name="k_pipeline"),
+)
+ir = kernel.build()
+result = model_native(kernel=ir, region=region, arch=arch)
+```
+
+`model_native` 在求值该周期区域时，会按 `loop_name` 取得对应声明并进行转换；不要求用户事先手动排一次流水。若已经提供 `PeriodicAxisIR(dag=dag)`，则跳过下面的前端转换，直接消费这张图。
 
 前端 `pipeline.after(...)` 创建事件依赖并写入 `PeriodicLoopIR.dependencies`；`pipeline.carry(...)` 写入 carries。这些是边及其他声明，不是第二张独立设计的完整 DAG。
 
@@ -501,18 +590,29 @@ PeriodicAxisIR(dag=dag, ii_mode="periodic_best")
 
 ### 8.1 Dependency 的迭代距离
 
-流水层的边为：
+**`ScheduleDependency` 属于后端 `PeriodicDAG.dependencies`，不是直接写在 `LoopRegion` 上的字段。** LoopRegion 通过 `periodic_axis` 关联 DAG。下面把声明位置一起写出；`mma` 是已经包含 Timing 信息的后端 Phase：
 
 ```python
-ScheduleDependency(
-    source="mma", target="mma",
-    iteration_distance=1, min_delay=None,
+dag = PeriodicDAG(
+    phases=(mma,),
+    dependencies=(
+        ScheduleDependency(
+            source="mma", target="mma",
+            iteration_distance=1, min_delay=None,
+        ),
+    ),
+)
+region = LoopRegion(
+    name="k_loop",
+    trip_count=128,
+    body=iteration_region,  # 引用与此 DAG 匹配的前端 Phase
+    periodic_axis=PeriodicAxisIR(dag=dag),
 )
 ```
 
-表示 `start(mma, i+1) >= start(mma, i) + latency(mma)`。`min_delay=None` 使用 source 的完整 latency；`min_delay=0` 表示开始到开始约束，不要求等 source 完成。
+这条边表示 `start(mma, i+1) >= start(mma, i) + latency(mma)`。`min_delay=None` 使用 source 的完整 latency；`min_delay=0` 表示开始到开始约束，不要求等 source 完成。
 
-前端事件依赖还可直接写 `pipeline.after(a.done, b.start, distance=1)`，或使用有状态名称的 `StateCarry`。普通同轮数据流 distance 为 0。后端也支持有符号距离来表达展开窗口中的操作位置，但必须满足其因果性限制，不能任意写负距离绕过约束。
+如果走官方前端，则写 `pipeline.after(a.done, b.start, distance=1)`，或使用有状态名称的 `StateCarry`；声明保存在 `PeriodicLoopIR` 中，经官方转换成为后端 DAG 的依赖。此时 Region 用 `PeriodicAxisIR(loop_name="k_pipeline")` 引用前端循环，不必手动再填写一份 `ScheduleDependency`。普通同轮数据流 distance 为 0。后端也支持有符号距离来表达展开窗口中的操作位置，但必须满足其因果性限制，不能任意写负距离绕过约束。
 
 周期模板可能包含带距离的回边或自环；边连接不同迭代的实例，不等于单轮存在非法循环依赖。
 
