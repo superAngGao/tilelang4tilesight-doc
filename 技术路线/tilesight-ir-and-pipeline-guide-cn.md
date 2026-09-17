@@ -4,51 +4,72 @@
 
 接口依据：官方 TileSight 固定版本 `48e4158459bee5df830ae4ab7dda541edaa3dc4d`。本文描述该版本，不承诺后续版本接口不变。
 
-## 1. 从前端 Phase 到后端流水排程
+## 1. 分析范围与两个核心概念：Phase、PeriodicDAG
 
-### 1.1 前端 Phase：描述一项需要安排执行的工作
+**我们输入给 TileSight 的是 tile 操作的信息，包括操作的属性和操作之间的依赖；TileSight 输出的是这些操作在给定约束下的预测流水。** 我们的前端负责从 Python／IR 提取信息，TileSight 不再重新理解原始 kernel 代码。
 
-接入 TileSight，首先要把 kernel 中的工作整理成前端 **Phase（阶段）**。例如加载一个 tile、一次矩阵乘累加、一组逐元素计算，都可以由 Phase 表示。它是建模时划分的工作单位，不要求等于一条机器指令，也不要求与一个 TileLang 调用一一对应。
+先以“前置顺序操作 → 一个循环 → 后置顺序操作”为基本分析范围来理解：
 
-前端类型是 `tilesight.tilesight_new_api.ir.Phase`。下面将 dataclass 自动生成的构造签名展开，省略实现；`Tuple`、`Optional`、`Sequence` 为 Python 类型注解：
-
-```python
-class Phase:
-    def __init__(
-        self,
-        name: str,
-        actor: str,
-        owner: str,
-        work: Work,
-        timing: Optional[Timing] = None,
-        reads: Tuple[Buffer, ...] = (),
-        writes: Tuple[Buffer, ...] = (),
-    ) -> None: ...
+```text
+前置操作                 循环中的操作及跨轮关系                后置操作
+例如初始化、预加载        例如 load → compute，跨轮预取         例如写回
+       └────────────────────────┬────────────────────────────────┘
+                         Region 组织执行结构
+                                │
+                    循环绑定一个 PeriodicDAG
+                                ↓
+                    循环内及跨轮的 Phase 流水
+                                ↓
+             结合循环次数、前后操作及 launch 环境计算总时间
 ```
 
-| 字段 | 含义 |
-|---|---|
-| `name` | 阶段名称，用于在所属循环的声明中引用该阶段；不是全局 kernel 名称 |
-| `actor` | 负责这项工作的执行角色名称，例如 producer、consumer；不是资源名称或线程编号 |
-| `owner` | 所属前端循环的内部身份，用来检查阶段与 Buffer 等对象是否属于同一个循环；通常由构建接口填写 |
-| `work` | 做什么、做多少，例如矩阵乘 FLOPs、搬运字节数及 dtype 等属性；不是耗时 |
-| `timing` | 这项工作的完成延迟和资源占用。可直接提供；未提供时，后续转换需要通过成本解析入口取得，不能当作零耗时 |
-| `reads` / `writes` | 读取、写入哪些前端 Buffer；供数据流及存储相关约束使用，不等于完整的依赖边集合 |
+这里有两个最重要的概念：
 
-实际声明时，通常不直接填写 `actor` 和 `owner`，而是通过 `tilesight.tilesight_new_api.frontend.Actor.phase` 创建。其方法签名是：
+- **Phase（阶段）**：表示一项 tile 级工作的基本流水单元，例如 tile 加载、矩阵乘累加或一组逐元素计算。
+- **PeriodicDAG（周期依赖图）**：承载循环流水关系，包含阶段、同轮／跨轮依赖、缓冲容量和必要资源顺序，是周期调度器直接分析和计算的对象。
+
+范围上需要区分：**一次周期 DAG 分析针对一个循环的重复工作及其跨轮关系；循环前后的顺序操作由 Region 层组合，不是自动加入同一个周期 DAG 排程。** TileSight 也能表达多个循环和嵌套 Region，但不会自动把整个 kernel 的所有循环合并成一个跨区域流水。嵌套周期宏的具体限制见后文“能力边界”。
+
+### 1.1 前端 Phase：输入 tile 操作的信息
+
+前端类型位于 `tilesight.tilesight_new_api.ir`。用下面的带注释调用形式看接口最直接；变量名代表待提供的数据，不是一段可独立运行的程序：
 
 ```python
-def phase(
-    self,
-    name: str,
-    *,
-    work: Work,
-    timing: Optional[Timing] = None,
-    reads: Sequence[Buffer] = (),
-    writes: Sequence[Buffer] = (),
-) -> Phase: ...
+Phase(
+    name,           # 阶段名称
+    actor,          # 所属执行角色
+    owner,          # 所属循环的内部身份
+    work,           # 工作内容及数量
+    timing=None,    # 完成延迟和资源服务时间；未提供时需由成本入口解析
+    reads=(),       # 读取哪些 Buffer
+    writes=(),      # 写入哪些 Buffer
+)
 
-# consumer 是已经创建的 Actor；work、timing、buffer 由调用方提供。
+Work(
+    kind,           # 工作种类，例如 copy、mma、pointwise
+    flops=0.0,      # 计算工作量
+    bytes=0.0,      # 搬运工作量
+    attrs=(),       # dtype、形状等补充语义属性
+)
+
+Timing(
+    latency,        # 阶段从开始到完成的时间，单位秒
+    resources=(
+        ResourceTiming(
+            resource,       # 使用哪个建模资源
+            service_time,   # 占用该资源多久，单位秒
+            offset=0.0,     # 相对阶段起点何时开始占用
+        ),
+        # 可以继续列出其他资源
+    ),
+)
+```
+
+Phase 表达“这项操作做什么、做多少、读写什么、由谁负责、需要多少时间和资源”。**依赖是 Phase 之间的关系，在所属循环／pipeline 中另外声明，不是 Phase 构造参数里的内嵌字段。** grid、CTA 驻留等执行环境也在 Phase 之外。
+
+通常通过已创建的 actor 登记 Phase：
+
+```python
 mma = consumer.phase(
     "mma",
     work=mma_work,
@@ -58,102 +79,83 @@ mma = consumer.phase(
 )
 ```
 
-该方法会填写执行角色和所属循环，并登记 Phase。**依赖关系、缓冲容量、actor 顺序等在循环／pipeline 层声明，不都塞在 Phase 字段中；grid 和 CTA 驻留等执行环境也在 Phase 之外。** 这些声明共同构成排流水的条件。
+这个接口会自动填写 `actor`、`owner` 并登记阶段。仅填写 Work 并不等于已经得到 Timing；`timing=None` 也不表示零耗时。
 
-### 1.2 TileSight 的职责：将阶段及约束转换为 DAG，再安排执行
+“tile 操作是基本单位”说的是建模粒度，不要求 Phase 与一个 TileLang 调用或一条机器指令一一对应。依据工作和调度边界，一个操作可以拆成多个 Phase，多个操作也可以组合为一个 Phase。
 
-就流水分析而言，TileSight 的职责是：在给定工作成本、依赖、缓冲容量和资源竞争条件下，安排这些 Phase 在不同循环迭代中的执行实例，得到阶段起点、稳态 II 和资源使用顺序。它不会自动把阶段继续拆成机器指令，也不会仅凭 Phase 名称猜出 kernel 的语义。
+### 1.2 PeriodicDAG：循环流水关系的载体
 
-前端声明进入周期流水分析的关系是：
-
-```text
-前端 Phase：Work、Timing、actor、读写 Buffer
-  ＋ 所属循环中的依赖、跨轮状态、缓冲容量和必要顺序
-                 ↓ 解析每个阶段的 Timing，转换各项约束
-PeriodicDAG
-  ├─ phases：后端 Phase
-  ├─ dependencies：调度依赖
-  ├─ token_buffers：容量约束
-  └─ fixed_resource_orders：明确固定的资源顺序
-                 ↓ schedule_periodic_dag(dag)
-流水排程结果：阶段起点、II、资源顺序及相关边界信息
-```
-
-官方转换入口为 `lower_periodic(kernel: KernelIR, loop: str, oracle=None) -> PeriodicDAG`，也可以调用 `KernelIR.lower_periodic(loop_name, oracle=None)`。它在构建 DAG 时生成后端 Phase。**后端 Phase 是排程输入，不是排完流水后才产生的结果；阶段的绝对起点不保存在 Phase 构造参数中。** 有限循环和完整 kernel 时间还需结合后文的 Region、循环次数和 launch 执行环境计算。
-
-### 1.3 后端 Phase：调度器直接消费的节点
-
-后端类型是 `tilesight.fused_op_pipeline_wave.periodic_schedule.Phase`。它与前端 Phase 同名，但不是同一个类型。本文将导入别名写成 `SchedulePhase`，其构造签名为：
+将阶段及其约束组织起来，就得到周期调度器直接消费的 `PeriodicDAG`。固定版本的接口共有四组字段：
 
 ```python
-class SchedulePhase:  # 官方类名为 Phase，此处使用别名区分层次
-    def __init__(
-        self,
-        name: str,
-        latency: float,
-        resources: Tuple[ResourceUse, ...] = (),
-        iteration_offset: int = 0,
-    ) -> None: ...
-
-class ResourceUse:
-    def __init__(
-        self,
-        resource: str,
-        service_time: float,
-        offset: float = 0.0,
-    ) -> None: ...
-```
-
-| 字段 | 含义 |
-|---|---|
-| `name` | 当前 DAG 内的节点名称，依赖边据此引用它 |
-| `latency` | 从阶段开始到阶段完成的延迟，单位秒；不是整个 kernel 的时间 |
-| `resources` | 使用哪些建模资源、每种资源占用多久、从阶段开始后多久占用；用于排布资源竞争 |
-| `iteration_offset` | 在展开的调度窗口中，该阶段对应哪个逻辑迭代，通常为 0；不是秒数，也不是循环次数或依赖边的跨轮距离 |
-
-前后两层的核心映射为：
-
-```text
-前端 phase.name                   → 后端 phase.name
-解析后的 timing.latency           → 后端 phase.latency
-timing.resources: ResourceTiming   → 后端 phase.resources: ResourceUse
-actor/resource 序列中登记的
-  phase.at(...) 窗口声明           → 后端 phase.iteration_offset
-其余执行顺序、数据和存储约束       → DAG 的依赖、容量及固定资源顺序
-```
-
-因此，后端 Phase 不再保存 `Work`、`actor`、`reads`、`writes`：工作已落实为 Timing，相关执行语义已转换为调度约束。调度器直接消费这一层；它不需要再从 Python 代码重新推导这些事实。
-
-两层 Phase 及转换的固定版本源码见 [前端定义](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/tilesight_new_api/ir.py)、[声明接口](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/tilesight_new_api/frontend.py)、[DAG 转换](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/tilesight_new_api/lowering.py) 和 [后端定义](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/fused_op_pipeline_wave/periodic_schedule.py)。
-
-### 1.4 完成时间与资源占用不是相加关系
-
-前端时间对象的关键字段为：
-
-```python
-Timing(
-    latency=...,  # 从阶段开始到完成，单位秒
-    resources=(
-        ResourceTiming(resource="tensor", service_time=..., offset=...),
-    ),
+PeriodicDAG(
+    phases=phases,             # 后端 Phase 集合：阶段及其时间、资源需求
+    dependencies=(),           # 同轮和跨轮依赖
+    token_buffers=(),          # 有限容量的缓冲槽及获取／释放关系
+    fixed_resource_orders=(),  # 必须保持的资源使用顺序
 )
 ```
 
-- `latency`：阶段结果何时可用，影响后继的依赖等待。
-- `service_time`：某个建模资源被占用多久，影响其他阶段的资源竞争。
-- `offset`：资源占用相对阶段起点的偏移。
+其中 `phases` 是必填参数，且不能是空集合；其余三组默认是空元组。这里不能把 `phases=()` 理解成合法的空图默认值。
 
-例如阶段完成需要 100 ns，而资源只在 `[0, 30)` ns 被占用，则独立工作可以在资源释放后使用它，但依赖该阶段结果的工作仍需等到 100 ns。不是 `100 + 30 = 130 ns`。
+**所以，把 PeriodicDAG 称为“循环流水关系的载体”是准确的。** 它不仅列出有哪些操作，还规定了操作何时具备开始条件、跨轮需要等待什么、缓冲槽是否足够，以及共享资源的必要顺序。Phase 中的资源需求则让调度器识别资源竞争，不需要为每一对竞争者手写依赖边。
 
-一个 Phase 可以使用多个不同资源。资源列表的排列顺序没有时间含义，内部先后或重叠由 `offset` 明确给出；默认 `offset=0` 表示从阶段起点开始，不表示未知。调度器移动整个 Phase，不会重新搜索它内部各资源区间的排列。
+DAG 描述允许怎样执行，不是已经排好的时间线。调用：
 
-该版本不允许一个 Phase 多次声明同一资源；需要多段占用或希望内部操作也参与调度时，应拆成多个节点并补依赖。前端 `Timing` 还要求各资源区间不超出阶段完成时间。
+```python
+result = schedule_periodic_dag(dag)
+```
 
-### 1.5 Work 不会自动变成完整 Timing
+才会得到阶段起点、稳态 II、资源使用顺序和相关分析结果。循环次数及前后顺序操作不在这四组字段里；它们由 Region 等外层接口组织，再用于计算有限执行时间。
 
-`Work(kind, flops, bytes, attrs)` 是工作描述，不是现成成本。计算工作可以经官方 `bind_work_throughputs(op, arch, fallback_policy)` 获得各工作项的吞吐绑定和服务时间；这个函数消费具有 `work_items` 的语义操作对象，并非任意一个 `Work` 对象都可直接传入。
+### 1.3 真正放进 DAG 的后端 Phase 和 Dependency
 
-访存还需要相应的访问、缓存和层级流量分析。随后将得到的成本按明确的组合规则形成 Timing。将 dtype、工作数量或字节数填入 Work，不等于已解决成本、依赖或 grid 分析。
+`PeriodicDAG.phases` 中的 Phase 不是 1.1 的前端对象，而是 `tilesight.fused_op_pipeline_wave.periodic_schedule.Phase`。流水层只保留排程需要的信息，接口更精简。为避免同名混淆，下面使用 `SchedulePhase` 和 `ScheduleDependency` 作为导入别名：
+
+```python
+from tilesight.fused_op_pipeline_wave.periodic_schedule import (
+    Phase as SchedulePhase,
+    Dependency as ScheduleDependency,
+    ResourceUse,
+)
+
+SchedulePhase(
+    name,                    # 当前 DAG 内唯一的阶段名称
+    latency,                 # 阶段完成延迟，单位秒
+    resources=(
+        ResourceUse(
+            resource,        # 与其他阶段竞争的建模资源
+            service_time,    # 资源占用时间，单位秒
+            offset=0.0,      # 资源占用相对阶段起点的偏移
+        ),
+    ),
+    iteration_offset=0,      # 展开窗口中，该阶段属于哪个逻辑迭代
+)
+
+ScheduleDependency(
+    source,                  # 源阶段名称
+    target,                  # 目标阶段名称
+    iteration_distance=0,    # 目标相对源跨越几轮；0 表示同轮
+    min_delay=None,          # 默认等待源阶段完成，也可指定就绪延迟
+    name="",                 # 可选的依赖名称
+)
+```
+
+`iteration_offset` 不是时间或循环次数，也不是依赖边的 `iteration_distance`。前者标识阶段在展开窗口中的逻辑迭代位置；后者描述源、目标之间的跨轮关系。
+
+后端 Phase 不再保存 `Work`、`actor`、`reads`、`writes`：工作已落实为 Timing，相关执行语义已转换成 DAG 约束。前后两层的核心映射是：
+
+```text
+前端 Phase.name                      → 后端 Phase.name
+解析后的 Timing.latency              → 后端 Phase.latency
+Timing.resources: ResourceTiming      → 后端 Phase.resources: ResourceUse
+actor/resource 序列中的 at(...) 声明 → 后端 Phase.iteration_offset
+依赖、跨轮状态、缓冲与必要顺序         → DAG 的其他三组字段
+```
+
+官方转换入口 `lower_periodic(kernel, loop, oracle=None)` 在构建 PeriodicDAG 时生成这些后端 Phase，再交给周期调度器。**后端 Phase 是排程输入；阶段起点和 II 是排程输出，不是 Phase 构造参数。** 同样，DAG 的 II 也不等于完整 kernel latency。
+
+固定版本源码：[前端 Phase、Work、Timing](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/tilesight_new_api/ir.py)、[前端声明接口](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/tilesight_new_api/frontend.py)、[DAG 转换](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/tilesight_new_api/lowering.py)、[后端 Phase 与 PeriodicDAG](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/fused_op_pipeline_wave/periodic_schedule.py)。
 
 ## 2. 从整体调用入口向内展开
 
@@ -173,25 +175,52 @@ model_native(kernel, region, arch, options=None, oracle=None)
 
 输出 `NativeModelResult` 包括 `region` 分析结果、`per_work_unit_s`、`resident_group_s`、`tail_wave_s`、`kernel_body_s`、grid/wave 信息、驻留信息和相关报告。`total_s` 还包含显式配置的 `launch_s` 与 `host_dispatch_s`，比较时间时必须区分口径。
 
-整体对象关系如下：
+整体对象关系如下，region 分支先以一个循环为例：
 
 ```text
 model_native
+│
 ├─ kernel: KernelIR
-│  └─ LaunchIR
-│     ├─ work_grid / physical_grid / threads / cluster / residency
-│     └─ PeriodicLoopIR
-│        ├─ ActorIR → 前端 Phase → Work、Timing、读写 buffer
-│        ├─ dependencies / carries
-│        └─ lifetimes / pipeline_buffers / resource_sequences
-├─ region: 递归执行结构
-│  ├─ PhaseRegion → 引用一个前端 Phase
-│  ├─ SequenceRegion → children
-│  └─ LoopRegion → body、trip_count、prologue、epilogue
-│                 └─ 可选 periodic_axis → loop_name 或显式 DAG
-├─ arch
-└─ options / 可选 oracle
+│   └─ LaunchIR
+│       ├─ work_grid / physical_grid
+│       ├─ threads / cluster / residency
+│       └─ PeriodicLoopIR（按名称登记的循环流水声明）
+│           ├─ ActorIR → 前端 Phase → Work、Timing、读写 buffer
+│           ├─ dependencies / carries
+│           └─ lifetimes / pipeline_buffers / resource_sequences
+│
+├─ region: 执行结构（传入一个根区域）
+│   └─ LoopRegion
+│       ├─ name / trip_count
+│       ├─ prologue → 前置区域，例如 PhaseRegion
+│       ├─ body     → 引用前端 Phase 的区域结构
+│       ├─ epilogue → 后置区域，例如 PhaseRegion
+│       └─ periodic_axis（可选）
+│           ├─ dag = 显式 PeriodicDAG
+│           └─ 或 loop_name = 引用 kernel 中的周期循环
+│
+├─ arch: 硬件能力
+│
+├─ options: 分析策略
+│
+└─ oracle: 可选的成本解析接口
 ```
+
+**有多个 region 时，不是给 `model_native` 连续追加多个参数，而是先组织成一个根 region。** 如果它们按完成后再开始的顺序执行，就依次写进 `SequenceRegion.children`：
+
+```python
+region = SequenceRegion(
+    name="main",
+    children=(initialize_region, loop_region, store_region),
+)
+result = model_native(kernel, region, arch)
+```
+
+每个 child 可以是 PhaseRegion、LoopRegion 或另一个 SequenceRegion。这里的顺序组合明确要求子区域串行完成，不能用它冒充任意并行关系；同一组前后操作也不要既放在 children 中，又重复放进循环的 prologue/epilogue。
+
+**`PeriodicLoopIR` 是循环流水的声明，不只是循环的名字或结构占位。** 它保存参与的 actor、Phase、依赖、跨轮状态和容量等约束；`LoopRegion` 则描述该循环在程序中的位置、执行次数、body 和前后操作。两者通过 `LoopRegion.periodic_axis.loop_name` 显式关联：例如区域可以叫 `k_loop`，而 `loop_name="k_pipeline"` 引用已登记的 `PeriodicLoopIR("k_pipeline", ...)`。两个对象自己的名称不必相同，也不会按名称相似性自动绑定。
+
+使用 `periodic_axis.dag` 时则直接提供后端图，不必再通过 `loop_name` 转换；两种绑定方式二选一。循环外的前后顺序操作由 region 树表示，不是都登记成这个周期循环中的重复工作。
 
 这些是建模对象，不是 TileLang/TVM 编译器中的原始 TIR 节点。
 
@@ -252,7 +281,38 @@ actor.sequence(a.at(0), b.at(0), order="issue")
 
 相同资源名称的 ResourceTiming 表示对同一建模资源的竞争。通常不应为每一对竞争者手动加依赖；只有必须固定仲裁顺序时才声明 `resource_sequence`。不能仅凭 Python 源码行号把所有 actor 的操作固定成一个全局顺序。
 
-## 5. 连贯示例：分块矩阵乘的前端声明与完整分析
+## 5. 工作量、完成时间与资源占用
+
+### 5.1 完成时间与资源占用不是相加关系
+
+前端时间对象的关键字段为：
+
+```python
+Timing(
+    latency=...,  # 从阶段开始到完成，单位秒
+    resources=(
+        ResourceTiming(resource="tensor", service_time=..., offset=...),
+    ),
+)
+```
+
+- `latency`：阶段结果何时可用，影响后继的依赖等待。
+- `service_time`：某个建模资源被占用多久，影响其他阶段的资源竞争。
+- `offset`：资源占用相对阶段起点的偏移。
+
+例如阶段完成需要 100 ns，而资源只在 `[0, 30)` ns 被占用，则独立工作可以在资源释放后使用它，但依赖该阶段结果的工作仍需等到 100 ns。不是 `100 + 30 = 130 ns`。
+
+一个 Phase 可以使用多个不同资源。资源列表的排列顺序没有时间含义，内部先后或重叠由 `offset` 明确给出；默认 `offset=0` 表示从阶段起点开始，不表示未知。调度器移动整个 Phase，不会重新搜索它内部各资源区间的排列。
+
+该版本不允许一个 Phase 多次声明同一资源；需要多段占用或希望内部操作也参与调度时，应拆成多个节点并补依赖。前端 `Timing` 还要求各资源区间不超出阶段完成时间。
+
+### 5.2 Work 不会自动变成完整 Timing
+
+`Work(kind, flops, bytes, attrs)` 是工作描述，不是现成成本。计算工作可以经官方 `bind_work_throughputs(op, arch, fallback_policy)` 获得各工作项的吞吐绑定和服务时间；这个函数消费具有 `work_items` 的语义操作对象，并非任意一个 `Work` 对象都可直接传入。
+
+访存还需要相应的访问、缓存和层级流量分析。随后将得到的成本按明确的组合规则形成 Timing。将 dtype、工作数量或字节数填入 Work，不等于已解决成本、依赖或 grid 分析。
+
+## 6. 连贯示例：分块矩阵乘的前端声明与完整分析
 
 示例为 `M=N=K=8192`、`BM=BN=128`、`BK=64`，每个输出 tile 的 K 循环为 128 轮，逻辑 grid 为 `64×64`。每轮 FP16 A/B 各加载 16 KiB，矩阵乘工作量为 `2×128×128×64` FLOPs。
 
@@ -377,7 +437,7 @@ print("kernel body (s):", result.kernel_body_s)
 
 原始源程序的对应关系为：循环前 clear → initialize；循环内 copy A/B、矩阵乘 → body；循环后写回 → store。对其他程序必须按实际循环和作用域提取，不能按算子名字套用这个边界。
 
-## 6. 官方前端如何组装 PeriodicDAG
+## 7. 官方前端如何组装 PeriodicDAG
 
 前端 `pipeline.after(...)` 创建事件依赖并写入 `PeriodicLoopIR.dependencies`；`pipeline.carry(...)` 写入 carries。这些是边及其他声明，不是第二张独立设计的完整 DAG。
 
@@ -403,7 +463,7 @@ PeriodicDAG(
 
 **先生成图，再分析流水。PeriodicDAG 是输入，不是已经排好流水的结果。** 硬件能力通过成本绑定等步骤进入资源时间；不能只给 actor 名称就期望它自动推导全部硬件行为。
 
-### 6.1 直接构图可以绕过官方建模前端
+### 7.1 直接构图可以绕过官方建模前端
 
 等价层次的接口示意如下，变量中的时间仍需提前提供：
 
@@ -425,7 +485,7 @@ envelope = schedule_periodic_dag(dag)
 
 这里只展示加载与计算，不是前面完整累加循环的替代图。直接 DAG 的 Phase 不必绑定 actor；相关程序约束需由构图方明确提供。名称在当前 DAG 内唯一，不能仅凭字符串引用另一个独立 DAG 的阶段。
 
-### 6.2 单独分析 DAG 与完整 kernel 分析
+### 7.2 单独分析 DAG 与完整 kernel 分析
 
 `schedule_periodic_dag(dag)` 不需要 KernelIR、Region 或 grid。返回 `ScheduleEnvelope`，包括 best/worst 的 II、阶段起点、资源顺序、下界、搜索完整性等。best/worst 是所搜索合法资源顺序的结果，不是任意等待下的绝对最快/最慢实际执行时间；只有搜索完整等条件成立时才能作更强的全局表述。
 
@@ -437,9 +497,9 @@ PeriodicAxisIR(dag=dag, ii_mode="periodic_best")
 
 传入的是输入图 `dag`，不是分析结果 `envelope`。`dag` 和 `loop_name` 二选一；不要为了构造 axis 而先重复跑一遍调度。
 
-## 7. 跨轮依赖、状态与缓冲区复用
+## 8. 跨轮依赖、状态与缓冲区复用
 
-### 7.1 Dependency 的迭代距离
+### 8.1 Dependency 的迭代距离
 
 流水层的边为：
 
@@ -456,7 +516,7 @@ ScheduleDependency(
 
 周期模板可能包含带距离的回边或自环；边连接不同迭代的实例，不等于单轮存在非法循环依赖。
 
-### 7.2 TokenBuffer 不是 ResourceUse
+### 8.2 TokenBuffer 不是 ResourceUse
 
 ```python
 TokenBuffer(name="tiles", acquire="load", release="mma", capacity=3)
@@ -472,7 +532,7 @@ TokenBuffer(name="tiles", acquire="load", release="mma", capacity=3)
 
 数据留在 shared memory 中等待使用，不表示一直占用 SMEM 带宽。槽位、容量和带宽不能相互替代。
 
-## 8. grid、硬件能力与时间口径
+## 9. grid、硬件能力与时间口径
 
 `LaunchIR` 提供 `work_grid`、`physical_grid`、`threads`、`cluster`、`residency`、`scheduler`、`swizzle` 等声明，均不是 Phase 自身的字段。
 
@@ -484,7 +544,7 @@ TokenBuffer(name="tiles", acquire="load", release="mma", capacity=3)
 
 时间应分别报告阶段完成时间、资源服务时间、II、有限 CTA/工作单元完成时间、kernel-body latency、launch/host 开销。不能把 II 当作 kernel latency，也不能把所有阶段时间简单相加后当作流水结果。
 
-## 9. 能力边界：技术报告必须披露的内容
+## 10. 能力边界：技术报告必须披露的内容
 
 | 边界 | 当前固定版本的行为 | 对前端的要求 |
 |---|---|---|
@@ -502,7 +562,7 @@ TokenBuffer(name="tiles", acquire="load", release="mma", capacity=3)
 
 也不能把“任意两个 Region 都不能重叠”当成结论：同一个周期 body 下的多个 PhaseRegion 可以进入同一张 DAG 联合分析。真正需要说明的是 **Region 执行器不会自动跨独立区域建立全局联合流水图**。
 
-## 10. 与我们当前实际调用链的关系
+## 11. 与我们当前实际调用链的关系
 
 上面的完整例子演示官方“前端声明 → DAG → 原生区域执行器”的使用方式，不代表 adapter 当前所有路径都走这套 builder。
 
@@ -523,7 +583,7 @@ Python builder → 高层 TIR
 
 其中 CTA 汇总 Phase 只是 grid 接口转换对象，不是新增的语义 tile 操作。原始阶段图、成本与执行关系应继续保留，不能用汇总 Phase 冒充原流水图。报告中也不能声称已完成官方任意嵌套 Region 的通用自动接入。
 
-## 11. 给前端设计的结论
+## 12. 给前端设计的结论
 
 我们的核心输出不是一个 kernel 类别，而是：
 
@@ -537,7 +597,7 @@ Python builder → 高层 TIR
 
 一句话总结：**Phase 是工作和成本的单位，DAG 是流水约束的单位，Region 是程序组合的单位，Launch 是空间执行环境。四者各司其职，不可互相替代。**
 
-## 12. 官方源码索引
+## 13. 官方源码索引
 
 以下均指上述固定版本，核对或升级接口时以实现为准：
 
