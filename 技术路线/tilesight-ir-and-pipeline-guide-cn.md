@@ -4,20 +4,129 @@
 
 接口依据：官方 TileSight 固定版本 `48e4158459bee5df830ae4ab7dda541edaa3dc4d`。本文描述该版本，不承诺后续版本接口不变。
 
-## 1. 基本单位：Phase 与资源时间
+## 1. 从前端 Phase 到后端流水排程
 
-TileSight 流水分析的基本单位是 **Phase，以及 Phase 在不同循环迭代中的执行实例**。分析器安排阶段起点，根据阶段的完成延迟、资源需求及依赖确定可行流水。它不会自动把阶段继续拆成机器指令。
+### 1.1 前端 Phase：描述一项需要安排执行的工作
 
-有两个同名但不同层次的 Phase：
+接入 TileSight，首先要把 kernel 中的工作整理成前端 **Phase（阶段）**。例如加载一个 tile、一次矩阵乘累加、一组逐元素计算，都可以由 Phase 表示。它是建模时划分的工作单位，不要求等于一条机器指令，也不要求与一个 TileLang 调用一一对应。
 
-| 层次 | 类型所在模块 | 主要内容 |
-|---|---|---|
-| 前端语义 Phase | `tilesight.tilesight_new_api.ir` | `name`、`actor`、`owner`、`work`、`timing`、`reads`、`writes` |
-| DAG 调度节点 Phase | `tilesight.fused_op_pipeline_wave.periodic_schedule` | `name`、`latency`、`resources`、`iteration_offset` |
+前端类型是 `tilesight.tilesight_new_api.ir.Phase`。下面将 dataclass 自动生成的构造签名展开，省略实现；`Tuple`、`Optional`、`Sequence` 为 Python 类型注解：
 
-前者方便声明工作和执行语义，后者是调度器直接消费的节点。文中的代码会用 `SchedulePhase` 指代后者，避免混淆。
+```python
+class Phase:
+    def __init__(
+        self,
+        name: str,
+        actor: str,
+        owner: str,
+        work: Work,
+        timing: Optional[Timing] = None,
+        reads: Tuple[Buffer, ...] = (),
+        writes: Tuple[Buffer, ...] = (),
+    ) -> None: ...
+```
 
-### 1.1 完成时间与资源占用不是相加关系
+| 字段 | 含义 |
+|---|---|
+| `name` | 阶段名称，用于在所属循环的声明中引用该阶段；不是全局 kernel 名称 |
+| `actor` | 负责这项工作的执行角色名称，例如 producer、consumer；不是资源名称或线程编号 |
+| `owner` | 所属前端循环的内部身份，用来检查阶段与 Buffer 等对象是否属于同一个循环；通常由构建接口填写 |
+| `work` | 做什么、做多少，例如矩阵乘 FLOPs、搬运字节数及 dtype 等属性；不是耗时 |
+| `timing` | 这项工作的完成延迟和资源占用。可直接提供；未提供时，后续转换需要通过成本解析入口取得，不能当作零耗时 |
+| `reads` / `writes` | 读取、写入哪些前端 Buffer；供数据流及存储相关约束使用，不等于完整的依赖边集合 |
+
+实际声明时，通常不直接填写 `actor` 和 `owner`，而是通过 `tilesight.tilesight_new_api.frontend.Actor.phase` 创建。其方法签名是：
+
+```python
+def phase(
+    self,
+    name: str,
+    *,
+    work: Work,
+    timing: Optional[Timing] = None,
+    reads: Sequence[Buffer] = (),
+    writes: Sequence[Buffer] = (),
+) -> Phase: ...
+
+# consumer 是已经创建的 Actor；work、timing、buffer 由调用方提供。
+mma = consumer.phase(
+    "mma",
+    work=mma_work,
+    timing=mma_timing,
+    reads=(a_tile, b_tile),
+    writes=(accumulator,),
+)
+```
+
+该方法会填写执行角色和所属循环，并登记 Phase。**依赖关系、缓冲容量、actor 顺序等在循环／pipeline 层声明，不都塞在 Phase 字段中；grid 和 CTA 驻留等执行环境也在 Phase 之外。** 这些声明共同构成排流水的条件。
+
+### 1.2 TileSight 的职责：将阶段及约束转换为 DAG，再安排执行
+
+就流水分析而言，TileSight 的职责是：在给定工作成本、依赖、缓冲容量和资源竞争条件下，安排这些 Phase 在不同循环迭代中的执行实例，得到阶段起点、稳态 II 和资源使用顺序。它不会自动把阶段继续拆成机器指令，也不会仅凭 Phase 名称猜出 kernel 的语义。
+
+前端声明进入周期流水分析的关系是：
+
+```text
+前端 Phase：Work、Timing、actor、读写 Buffer
+  ＋ 所属循环中的依赖、跨轮状态、缓冲容量和必要顺序
+                 ↓ 解析每个阶段的 Timing，转换各项约束
+PeriodicDAG
+  ├─ phases：后端 Phase
+  ├─ dependencies：调度依赖
+  ├─ token_buffers：容量约束
+  └─ fixed_resource_orders：明确固定的资源顺序
+                 ↓ schedule_periodic_dag(dag)
+流水排程结果：阶段起点、II、资源顺序及相关边界信息
+```
+
+官方转换入口为 `lower_periodic(kernel: KernelIR, loop: str, oracle=None) -> PeriodicDAG`，也可以调用 `KernelIR.lower_periodic(loop_name, oracle=None)`。它在构建 DAG 时生成后端 Phase。**后端 Phase 是排程输入，不是排完流水后才产生的结果；阶段的绝对起点不保存在 Phase 构造参数中。** 有限循环和完整 kernel 时间还需结合后文的 Region、循环次数和 launch 执行环境计算。
+
+### 1.3 后端 Phase：调度器直接消费的节点
+
+后端类型是 `tilesight.fused_op_pipeline_wave.periodic_schedule.Phase`。它与前端 Phase 同名，但不是同一个类型。本文将导入别名写成 `SchedulePhase`，其构造签名为：
+
+```python
+class SchedulePhase:  # 官方类名为 Phase，此处使用别名区分层次
+    def __init__(
+        self,
+        name: str,
+        latency: float,
+        resources: Tuple[ResourceUse, ...] = (),
+        iteration_offset: int = 0,
+    ) -> None: ...
+
+class ResourceUse:
+    def __init__(
+        self,
+        resource: str,
+        service_time: float,
+        offset: float = 0.0,
+    ) -> None: ...
+```
+
+| 字段 | 含义 |
+|---|---|
+| `name` | 当前 DAG 内的节点名称，依赖边据此引用它 |
+| `latency` | 从阶段开始到阶段完成的延迟，单位秒；不是整个 kernel 的时间 |
+| `resources` | 使用哪些建模资源、每种资源占用多久、从阶段开始后多久占用；用于排布资源竞争 |
+| `iteration_offset` | 在展开的调度窗口中，该阶段对应哪个逻辑迭代，通常为 0；不是秒数，也不是循环次数或依赖边的跨轮距离 |
+
+前后两层的核心映射为：
+
+```text
+前端 phase.name                   → 后端 phase.name
+解析后的 timing.latency           → 后端 phase.latency
+timing.resources: ResourceTiming   → 后端 phase.resources: ResourceUse
+actor/resource 序列中登记的
+  phase.at(...) 窗口声明           → 后端 phase.iteration_offset
+其余执行顺序、数据和存储约束       → DAG 的依赖、容量及固定资源顺序
+```
+
+因此，后端 Phase 不再保存 `Work`、`actor`、`reads`、`writes`：工作已落实为 Timing，相关执行语义已转换为调度约束。调度器直接消费这一层；它不需要再从 Python 代码重新推导这些事实。
+
+两层 Phase 及转换的固定版本源码见 [前端定义](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/tilesight_new_api/ir.py)、[声明接口](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/tilesight_new_api/frontend.py)、[DAG 转换](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/tilesight_new_api/lowering.py) 和 [后端定义](https://github.com/tile-ai/TileSight/blob/48e4158459bee5df830ae4ab7dda541edaa3dc4d/tilesight/fused_op_pipeline_wave/periodic_schedule.py)。
+
+### 1.4 完成时间与资源占用不是相加关系
 
 前端时间对象的关键字段为：
 
@@ -34,13 +143,13 @@ Timing(
 - `service_time`：某个建模资源被占用多久，影响其他阶段的资源竞争。
 - `offset`：资源占用相对阶段起点的偏移。
 
-例如阶段完成需要 100 ns，而资源只在 `0, 30)` ns 被占用，则独立工作可以在资源释放后使用它，但依赖该阶段结果的工作仍需等到 100 ns。不是 `100 + 30 = 130 ns`。
+例如阶段完成需要 100 ns，而资源只在 `[0, 30)` ns 被占用，则独立工作可以在资源释放后使用它，但依赖该阶段结果的工作仍需等到 100 ns。不是 `100 + 30 = 130 ns`。
 
 一个 Phase 可以使用多个不同资源。资源列表的排列顺序没有时间含义，内部先后或重叠由 `offset` 明确给出；默认 `offset=0` 表示从阶段起点开始，不表示未知。调度器移动整个 Phase，不会重新搜索它内部各资源区间的排列。
 
 该版本不允许一个 Phase 多次声明同一资源；需要多段占用或希望内部操作也参与调度时，应拆成多个节点并补依赖。前端 `Timing` 还要求各资源区间不超出阶段完成时间。
 
-### 1.2 Work 不会自动变成完整 Timing
+### 1.5 Work 不会自动变成完整 Timing
 
 `Work(kind, flops, bytes, attrs)` 是工作描述，不是现成成本。计算工作可以经官方 `bind_work_throughputs(op, arch, fallback_policy)` 获得各工作项的吞吐绑定和服务时间；这个函数消费具有 `work_items` 的语义操作对象，并非任意一个 `Work` 对象都可直接传入。
 
