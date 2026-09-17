@@ -78,7 +78,7 @@ CacheProblem(
     l1_5=None,                      # 可选 L1.5 配置
     l1_5_group_size=0,
     inner_iterations=1,
-    reduction=ReductionConfig(),
+    reduction=ReductionConfig(),     # 内层多轮访问的缓存压力近似，见 6.2
     sampling=SamplingConfig(),
     backend="tile_reuse_distance",
 )
@@ -103,6 +103,25 @@ CacheAccessIR：怎么访问
 ```
 
 ### 4.1 TensorTileRegion：数据区域，不是执行 Region
+
+先看一个例子：工作网格坐标为 `(m, n)`，在某一代表 K 轮，A tile 只随 m 改变，不随 n 改变：
+
+```python
+a_region = TensorTileRegion(
+    value="A",                       # 数据对象身份
+    index_map=Projection(axes=(0,)),  # 只取工作坐标的 m 维作为 tile 身份
+    tile_shape=(128, 64),            # 每次访问 128×64 个元素
+    element_bytes=2,                # 每元素 2 字节，共 16384 字节
+)
+
+a_read = CacheAccessIR(
+    name="load_a",                  # 访问结果的查找名称
+    region=a_region,                # 访问上面定义的数据区域
+    mode="read",
+)
+```
+
+不同 n 的工作块因此可以复用同一个 A tile。`a_region` 描述“访问什么”，`a_read` 描述“以什么方式访问”；这里的 Region 不是流水分析中的 LoopRegion。
 
 | 字段 | 含义 |
 |---|---|
@@ -186,11 +205,24 @@ L1.5 是该模型使用的层级抽象，不能未经口径核对就把它当作
 
 ### 6.2 内层循环并非任意嵌套循环的逐事件模拟
 
-`ReductionConfig` 支持：
+`reduction` 不是求和／最大值等计算操作的配置，而是**怎样近似内层多轮访问对缓存的影响**。名字来自 GEMM 的 K 归约轴：例如 `K=8192, BK=64` 有 128 轮，每轮访问不同的 A/B tile，但上面的 `Projection((0,))` 只描述了一轮中 A 如何在不同输出工作块之间复用，并未列出全部 128 轮的地址序列。
 
-- `anonymous_inner`：用其他轮次造成的匿名不同数据占用来近似缓存压力。
-- `stable_shadow_cohort`：选择代表 K 轮，用稳定的前后数据集合近似其他轮次；含 wave 内进度近似。
-- 可选 `ProgressJitterConfig`：扰动查询用的距离，近似 CTA 进度偏差；不更新缓存状态为一条真实时间轨迹。
+因此需要同时填写：
+
+```python
+inner_iterations = 128
+reduction = ReductionConfig(mode="anonymous_inner")
+# 两者作为 CacheProblem 的对应参数传入。
+```
+
+`inner_iterations` 告诉模型有多少轮；`reduction` 告诉模型如何用近似方式计入其他轮次的缓存占用。它不负责设置流水次数，也不计算 reduction 操作的耗时。
+
+`ReductionConfig` 支持两种模式：
+
+- `anonymous_inner`（默认）：每个 wave 的代表访问处理后，按“该 wave 不同数据的占用量 × 其他轮次数”插入匿名缓存占用。上例中其他轮次数为 127；这些占用会增大后续复用距离，但不会推导被省略 K 轮在不同 wave 之间的复用。
+- `stable_shadow_cohort`：通过 `representative_k` 选一个代表 K 轮，用有稳定身份的前后数据集合近似其他轮次；假设 K 轮访问规律一致，并采用 wave 内进度近似。它仍不是全部 K 轮的命中率分布。
+
+后一种模式还可配置 `ProgressJitterConfig`，扰动查询用的距离以近似 CTA 进度偏差；不因此得到真实执行时间轨迹。两种多轮处理都应在报告中标为近似，而不是已逐轮模拟。
 
 `SamplingConfig(seed=0, sample_budget=None)` 不启用请求预算抽样。但 wave 内随机化和内层循环近似仍可能存在，因此“取消抽样”不等于“精确硬件模拟”。
 
@@ -258,6 +290,26 @@ semantic access IDs ↔ cache access name ↔ phase ID
 
 当前这条访存组合使用官方 OpGroup 的最大资源时间作为完成时间，各资源偏移为零。这是明确的服务时间组合假设，不是逐次 DDR→L2→SMEM 的串行往返延迟。Timing 的完成时间和资源时间也不能再次相加。
 
+例如，假设单次 Phase 的分层字节需求已换算为 DDR 80 ns、L2 60 ns、SMEM 40 ns 的服务时间，封装结果如下。**这些是说明输出形式的人为数值，不是第 9 节的运行结果或 H200 定标数据；资源名称只是示意，实际必须与其他 Phase 的资源命名保持一致。**
+
+```python
+from tilesight.tilesight_new_api.ir import Timing, ResourceTiming
+
+ns = 1e-9
+memory_timing = Timing(
+    latency=80 * ns,  # max(80, 60, 40)，不是三者相加
+    resources=(
+        ResourceTiming(resource="ddr", service_time=80 * ns, offset=0.0),
+        ResourceTiming(resource="l2", service_time=60 * ns, offset=0.0),
+        ResourceTiming(resource="smem", service_time=40 * ns, offset=0.0),
+    ),
+)
+```
+
+这表示：相对 Phase 起点，DDR 占用 `[0,80)` ns，L2 占用 `[0,60)` ns，SMEM 占用 `[0,40)` ns，整个 Phase 在 80 ns 完成。同一资源上的其他 Phase 需要与其竞争；不是把三层看成互不相关的三个完整操作，也不是按列表顺序串行执行。
+
+缓存命中率通过**各层服务的字节量**间接影响上述 Timing，并不直接成为 `Timing` 的字段。SMEM 需求则来自源层读写统计，不是 L2 命中率分析自动给出的 bank-conflict 成本。
+
 ## 9. 可运行示例：规则 GEMM 的 A/B 读取
 
 以下示例使用官方 H200 架构表，但只展示 A/B 读取的缓存分析。不含 C 写回、SMEM、计算与流水，因此不是完整 GEMM latency 预测，也不用于宣称精度。相联度取 8 是示例模型配置，不是新测得的 H200 硬件事实。
@@ -320,15 +372,9 @@ print("aggregate L2 hit:", result.aggregate.l2_hit_rate,
 
 示例故意只启用 L2，便于阅读条件命中率与服务比例的关系；实际启用 L1.5 时需同时提供该层配置及分组方式。泛化至不能整除的尺寸时，还必须处理尾块有效范围，不能照抄上述整除写法。
 
-## 10. 两种 swizzle 与当前边界
+## 10. SMEM bank conflict 与当前边界
 
-| 项目 | 表达方式 | 当前边界 |
-|---|---|---|
-| CTA 调度 swizzle | 工作块坐标和 `PanelTraversal` 等遍历配置 | 可影响复用距离；不等于硬件实际 CTA 发出轨迹 |
-| shared-memory layout swizzle | 逻辑元素到存储地址的布局关系；官方 `LayoutMapping(kind="swizzle")` 可记录布局转换 | 不是自动 bank-conflict 成本分析入口 |
-| shared-memory 访问成本 | 字节需求及官方 SMEM 带宽 | 不因此获得 lane 地址、bank 冲突或 lowering 插入搬运的精确成本 |
-
-在本次核对的固定版本中，未找到“输入各线程 SMEM 地址，自动输出 bank conflict 成本”的正式接口。`LayoutMapping` 主要用于片上交接、布局转换及消除中间搬运的证明，不能据字段名称扩大其能力。
+**当前固定版本的 TileSight 原生不支持 SMEM bank conflict 分析。** 可以根据 SMEM 访问字节数与带宽计算服务时间，但不能据此预测 bank 冲突及其额外成本。CTA 调度 swizzle 对缓存复用的影响见第 5 节，与此不是同一功能。
 
 本模块还具有以下限制：
 
