@@ -6,7 +6,11 @@
 
 ## 1. 分析范围与两个核心概念：Phase、PeriodicDAG
 
-**我们输入给 TileSight 的是 tile 操作的信息，包括操作的属性和操作之间的依赖；TileSight 输出的是这些操作在给定约束下的预测流水。** 我们的前端负责从 Python／IR 提取信息，TileSight 不再重新理解原始 kernel 代码。
+**从流水分析的角度看，TileSight 是一个针对 tile 级操作组装 DAG、分析 DAG 的工具。DAG 中的节点称为 Phase，表示一项 tile 级工作；边表示 Phase 之间的依赖，包括同轮与跨轮依赖。** 除了节点和依赖边，周期 DAG 还携带缓冲容量、必要资源顺序等约束。
+
+我们输入的是 tile 操作的属性、时间和资源需求，以及操作之间的关系。官方前端将这些声明组装为 `PeriodicDAG`，调度分析器再求解阶段起点、稳态 II 和重叠关系；也可以直接提交已构造的 PeriodicDAG，跳过官方前端组装。**图是排程输入，不是已经排好的流水。** 循环次数、前后操作及 grid 等外层信息进一步用于组合完整执行时间。
+
+我们的 adapter 负责从 Python／IR 提取上述信息，TileSight 不再重新理解原始 kernel 代码。
 
 先以“前置顺序操作 → 一个循环 → 后置顺序操作”为基本分析范围来理解：
 
@@ -466,6 +470,8 @@ result = model_native(
 print("per work unit (s):", result.per_work_unit_s)
 print("kernel body (s):", result.kernel_body_s)
 ```
+
+这里 `root.periodic_axis.loop_name="k_pipeline"` 按名称引用 `pipeline = launch.periodic("k_pipeline", ...)` 登记的循环声明；`root` 自己的名称 `"k_loop"` 不用于匹配。`root.body` 则引用该 pipeline 中登记的同一批 Phase。
 
 代码中的 `boundary_work` 只是前端声明容器，不表示实际还要额外执行一次循环。一次性工作的执行位置由 root 的 prologue/epilogue 指定。`stages=3` 也不能代替 buffer 的 acquire/release 关系。
 

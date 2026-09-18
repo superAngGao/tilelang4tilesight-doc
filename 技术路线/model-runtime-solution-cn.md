@@ -58,6 +58,71 @@ Python 提供可调用入口、构建参数及特化上下文。执行 kernel bu
 
 Python macro 展开后的操作可进入 TIR。我们以取得的实际 IR 为依据，不再把 Python 调用外观当作第二套操作事实。
 
+### 3.1 高层 TIR 的打印形式与实际提取入口
+
+`builder.get_tir(...)` 返回结构化 IR；选定其中的 `PrimFunc` 后，调用 `prim_func.script()` 可以将其打印成类似 Python 的 TVM Script。此时仍能看到 tile 级调用，例如：
+
+```python
+# 高层 TIR 打印形式的节选；省略外层函数、Buffer 声明和循环内其他操作。
+for ko in T.serial(32, annotations={"num_stages": 3}):
+    T.copy(
+        T.region(A[by * 128, ko * 32], 1, 128, 32),
+        T.region(A_shared[0, 0], 2, 128, 32),
+    )
+```
+
+这里已经有循环次数、索引表达式和 tile 访问范围，但还没有把 copy 展开成最终机器指令。打印出的 `for` 也不一定都是时间循环：`T.thread_binding(..., thread="blockIdx.x")` 等表达空间执行轴，必须读取节点的 kind 和 thread binding 加以区分。
+
+**我们的结构和操作提取入口是 PrimFunc 对象，不是对整份打印文本按行或用正则重新建树。** 同一个对象可以分成两条使用路径：
+
+```text
+builder.get_tir(...) → 选定 PrimFunc
+                        ├─ .script() → 供人阅读的文本及辅助身份记录
+                        └─ 遍历 .body 等字段 → 结构、表达式、操作和访问事实
+```
+
+例如循环直接读取 `For.loop_var`、`min`、`extent`、`kind`、`annotations`、`thread_binding` 和 `body`；调用直接读取 `Call.op` 与 `args`；数据对象读取 Buffer 的 shape、dtype、scope、strides 等。变量及其引用按 IR 对象关系处理，不靠变量名字猜用途。实际节点命名可能随 TileLang/TVM 版本变化，因此提取规则需要维护版本边界。
+
+### 3.2 分支与嵌套循环怎样存在于节点中
+
+嵌套不是记录在一段缩进字符串里，而是**父节点的字段引用子节点**。下面是用于解释结构的简化打印示意，假设 A、C、D 已声明；不是一个完整 GEMM：
+
+```python
+for i in T.serial(8):
+    for j in T.serial(4):
+        if A[i, j] > 0:
+            C[i, j] = A[i, j]
+            D[i, j] = 1
+        else:
+            C[i, j] = 0
+```
+
+对应的主要节点关系为：
+
+```text
+For：loop_var=i，min=0，extent=8
+└─ body → For：loop_var=j，min=0，extent=4
+          └─ body → IfThenElse
+                    ├─ condition → 比较表达式：BufferLoad(A, [i,j]) > 0
+                    ├─ then_case → SeqStmt
+                    │              └─ seq → [BufferStore(C, ...),
+                    │                         BufferStore(D, ...)]
+                    └─ else_case → BufferStore(C, ..., value=0)
+```
+
+| 节点 | 怎样保存下层结构 |
+|---|---|
+| `For` | `body` 引用循环体；循环体可以再次是 For，因此自然表达循环套循环 |
+| `IfThenElse` | `condition` 是条件表达式；`then_case`、`else_case` 分别引用两条分支，省略 else 时后者为空 |
+| `SeqStmt` | `seq` 保存按程序顺序排列的多个语句节点，不是字符串列表 |
+| `BufferStore` / `BufferLoad` | 保存 Buffer、索引表达式，以及写入值等；这些表达式还可以继续包含其他表达式节点 |
+
+实际 TIR 还可能包含 block、属性、局部变量绑定等包装。单条语句不一定有 SeqStmt 包装；表达式中的条件选择也可能是 `Select` 等表达式节点，不能只检查 IfThenElse。
+
+提取时递归进入子节点，并保留当前循环、条件和执行范围：进入内层循环时同时保留 i、j 的上下文；进入 then/else 时分别保留条件成立／不成立的约束，退出后恢复外层上下文。因此，取出两个分支的事实不等于把两边都计作必定执行。若条件依赖线程编号，还需区分不同线程集合的参与关系，不能当成整个 CTA 只选一边。
+
+这一阶段先保留嵌套和符号关系，不会无条件把循环全部展开；后续值求解、工作量和依赖组件再根据参数及必要输入确定执行范围。上例的条件取决于 A 的内容：仅凭 shape 无法确定各分支的执行次数，需要按第 4.2 节的输入规则处理。结构提取本身不要求先知道条件的结果。
+
 ## 4. 统一提取的信息
 
 | 类别 | 提取内容 | 后续消费者 |
