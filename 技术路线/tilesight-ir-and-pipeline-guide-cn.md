@@ -178,6 +178,17 @@ actor/resource 序列中的 at(...) 声明 → 后端 Phase.iteration_offset
 
 ## 2. 从整体调用入口向内展开
 
+TileSight 支持两种组图入口，最终都由同一个周期调度器分析：
+
+| 用法 | 谁组装后端 DAG | 接入位置 |
+|---|---|---|
+| 使用官方前端声明 | TileSight 根据前端 Phase、Actor 和循环关系转换 | `PeriodicAxisIR(loop_name="k_pipeline")` |
+| 用户自行构造 DAG | 用户直接创建后端 Phase、Dependency、TokenBuffer 等 | `PeriodicAxisIR(dag=dag)`；只分析流水时也可直接调用 `schedule_periodic_dag(dag)` |
+
+`dag` 与 `loop_name` 二选一。**自组装 DAG 是官方支持的入口，不需要先把图重新包装成官方前端依赖，再让 TileSight 组装一次。**
+
+### 2.1 完整区域与 kernel 时间分析入口
+
 原生区域执行器的入口是：
 
 ```python
@@ -242,6 +253,66 @@ result = model_native(kernel, region, arch)
 使用 `periodic_axis.dag` 时则直接提供后端图，不必再通过 `loop_name` 转换；两种绑定方式二选一。循环外的前后顺序操作由 region 树表示，不是都登记成这个周期循环中的重复工作。
 
 这些是建模对象，不是 TileLang/TVM 编译器中的原始 TIR 节点。
+
+### 2.2 用户自组装 DAG：直接分析或接入 Region
+
+下面用加载和计算两个节点展示接口位置。时间是教学输入，不代表实际性能；这里只展示局部关系，完整程序还应提供所需的累加状态等约束：
+
+```python
+from tilesight.fused_op_pipeline_wave.periodic_schedule import (
+    Phase as SchedulePhase,
+    Dependency as ScheduleDependency,
+    ResourceUse, TokenBuffer, PeriodicDAG, schedule_periodic_dag,
+)
+
+load = SchedulePhase(
+    name="load", latency=100e-9,
+    resources=(ResourceUse("tma", service_time=60e-9),),
+)
+compute = SchedulePhase(
+    name="compute", latency=180e-9,
+    resources=(ResourceUse("tensor", service_time=180e-9),),
+)
+dag = PeriodicDAG(
+    phases=(load, compute),
+    dependencies=(
+        ScheduleDependency("load", "compute"),  # 本轮加载完成后开始计算
+    ),
+    token_buffers=(
+        TokenBuffer("tiles", "load", "compute", capacity=3),
+    ),
+)
+
+# 用法一：只分析周期流水，不需要 KernelIR、Region 或 grid。
+envelope = schedule_periodic_dag(dag)
+```
+
+如果还要计算循环前后操作和完整 kernel 时间，则把**输入图 `dag`**放进 Region 的 `periodic_axis`，不是把分析结果 `envelope` 放进去：
+
+```python
+from tilesight.tilesight_new_api.regions import LoopRegion, PeriodicAxisIR
+from tilesight.tilesight_new_api.native_executor import model_native
+
+# 接线示意：kernel_ir、iteration_region、前后区域和 arch 已提前构造。
+root = LoopRegion(
+    name="main_loop",
+    trip_count=128,
+    body=iteration_region,
+    prologue=initialize_region,
+    epilogue=store_region,
+    periodic_axis=PeriodicAxisIR(
+        dag=dag,                    # 用户构造的后端图；不再填写 loop_name
+        ii_mode="periodic_best",
+    ),
+)
+result = model_native(kernel=kernel_ir, region=root, arch=arch)
+```
+
+这两段展示的是两种调用用途，**完整分析不要求先执行一次 `schedule_periodic_dag`**。执行器取得显式 DAG 后，会自行调用周期分析。
+
+需要注意：绕过前端组图，不等于绕过 `model_native` 的所有输入要求。当前 Region 的 `PhaseRegion` 仍引用前端 Phase；上面的 `iteration_region` 必须包含与 DAG 中 `load`、`compute` 的名称、完成时间和资源时间匹配的阶段，`kernel_ir` 仍提供 launch 等声明。后端 Phase 不能直接当作 PhaseRegion 的前端 Phase 使用。区别是周期依赖、缓冲和资源顺序以 `dag` 为输入，不再通过 `loop_name` 自动推导；可选的前端生命周期关联由 `liveness_loop_name` 另行指定。
+
+本项目当前主要采用“自行构造后端 DAG，再调用官方分析”的方式；完整实际调用链及 CTA 汇总接线见第 11 节，不应将本节接口示例当成 adapter 已逐项采用的完整 Region 组织方式。
 
 ## 3. Region：程序如何组织与重复
 
